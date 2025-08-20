@@ -1,0 +1,76 @@
+name: Build Android AAB (No local SDK needed)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: stable
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v2
+        with:
+          api-level: 34
+
+      - name: Bootstrap Flutter project (creates android/ios if missing)
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android,ios --project-name food_locator .
+          fi
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # If no keystore secret exists, generate one on the fly so the AAB can be signed.
+      - name: Generate temporary keystore (first run)
+        if: ${{ !secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          keytool -genkey -v -keystore upload-keystore.jks -storepass tempPass123 -keypass tempPass123 -keyalg RSA -keysize 2048 -validity 10000 -alias upload -dname "CN=Food Locator,O=Org,L=City,S=State,C=GB"
+          echo "TEMP_KEYSTORE_PATH=$PWD/upload-keystore.jks" >> $GITHUB_ENV
+          echo "TEMP_KEYSTORE_ALIAS=upload" >> $GITHUB_ENV
+          echo "TEMP_KEYSTORE_PASSWORD=tempPass123" >> $GITHUB_ENV
+
+      - name: Decode provided keystore (subsequent runs)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > upload-keystore.jks
+          echo "TEMP_KEYSTORE_PATH=$PWD/upload-keystore.jks" >> $GITHUB_ENV
+          echo "TEMP_KEYSTORE_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
+          echo "TEMP_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}" >> $GITHUB_ENV
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+
+      - name: Configure Gradle signing
+        run: |
+          cat >> android/key.properties <<'EOF'
+          storeFile=upload-keystore.jks
+          storePassword=${{ env.TEMP_KEYSTORE_PASSWORD }}
+          keyPassword=${{ env.TEMP_KEYSTORE_PASSWORD }}
+          keyAlias=${{ env.TEMP_KEYSTORE_ALIAS }}
+          EOF
+          sed -i.bak 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle || true
+
+      - name: Build AppBundle
+        run: flutter build appbundle --release
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbundle
+          path: build/app/outputs/bundle/release/*.aab
+
+      - name: Upload generated keystore (first run - save this!)
+        if: ${{ !secrets.ANDROID_KEYSTORE_BASE64 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-keystore
+          path: upload-keystore.jks
